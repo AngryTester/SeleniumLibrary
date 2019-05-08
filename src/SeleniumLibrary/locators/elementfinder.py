@@ -34,6 +34,7 @@ class ElementFinder(ContextAware):
             'id': self._find_by_id,
             'name': self._find_by_name,
             'xpath': self._find_by_xpath,
+            'xpath and index': self._find_by_xpath_and_index,
             'dom': self._find_by_dom,
             'link': self._find_by_link_text,
             'partial link': self._find_by_partial_link_text,
@@ -66,11 +67,29 @@ class ElementFinder(ContextAware):
                              'was {}.'.format(type(parent)))
         if self._is_webelement(locator):
             return locator
-        prefix, criteria = self._parse_locator(locator)
-        strategy = self._strategies[prefix]
-        tag, constraints = self._get_tag_and_constraints(tag)
-        elements = strategy(criteria, tag, constraints,
-                            parent=parent or self.driver)
+        # 如果定位信息中包含=>则走自定义定位，不影响默认定位
+        if locator.find("=>")!=-1:
+            index = 1
+            locator_dict = strToDict(locator)
+            # 先把index去掉
+            for key in locator_dict:
+                if(key=='index'):
+                    index = locator_dict['index']
+                    del locator_dict['index']
+                    break
+            xpath = buildXpath(locator_dict)
+            (prefix, criteria) = 'xpath and index',xpath
+            prefix = 'default' if prefix is None else prefix
+            strategy = self._strategies.get(prefix)
+            if strategy is None:
+                raise ValueError("Element locator with prefix '" + prefix + "' is not supported")
+            elements = strategy(criteria, index, parent=parent or self.driver)
+        else:
+            prefix, criteria = self._parse_locator(locator)
+            strategy = self._strategies[prefix]
+            tag, constraints = self._get_tag_and_constraints(tag)
+            elements = strategy(criteria, tag, constraints,
+                                parent=parent or self.driver)
         if required and not elements:
             raise ElementNotFound("%s with locator '%s' not found."
                                   % (element_type, locator))
@@ -124,6 +143,15 @@ class ElementFinder(ContextAware):
     def _find_by_xpath(self, criteria, tag, constraints, parent):
         return self._filter_elements(parent.find_elements_by_xpath(criteria),
                                      tag, constraints)
+
+    def _find_by_xpath_and_index(self, criteria, index, parent):
+        """
+        根据xpath和index定位\n
+        :param criteria: str xpath定位信息\n
+        :param index: int index索引，用于多结果时过滤\n
+        """
+        return self._filter_elements_with_index(
+            parent.find_elements_by_xpath(criteria), index)
 
     def _find_by_dom(self, criteria, tag, constraints, parent):
         self._disallow_webelement_parent(parent)
@@ -268,6 +296,16 @@ class ElementFinder(ContextAware):
         return [element for element in elements
                 if self._element_matches(element, tag, constraints)]
 
+    def _filter_elements_with_index(self, elements, index):
+        """
+        根据index过滤\n
+        :param elements: list 元素查找结果\n
+        :param index: int index索引，第几个元素\n
+        """
+        index = int(index)
+        elements = self._normalize(elements)
+        return elements[index - 1:index]
+
     def _get_attrs_with_url(self, key_attrs, criteria):
         attrs = []
         url = None
@@ -294,3 +332,83 @@ class ElementFinder(ContextAware):
             logger.debug("WebDriver find returned %s" % elements)
             return []
         return elements
+
+def strToDict(locator):
+    """
+    将格式id=>123,name=>234字符串转为字典便于后续处理\n
+    :param locator: str 定位信息，格式参考：text=>123,class=>234 \n
+    """
+    dict = {}
+    # 如果存在xpath信息，则直接使用
+    if locator.find('xpath=>')!=-1:
+        locatorlist = locator.split('=>')
+        dict[locatorlist[0]] = locatorlist[1]
+        return dict
+    locatorlist = locator.split(',')
+    for i in range(len(locatorlist)):
+        if locatorlist[i].find('=>')==-1:
+            raise Exception(u'[%s]格式错误,请参照（属性=>属性值）' % locatorlist[i])
+        optionlist = locatorlist[i].split('=>')
+        # 支持正则匹配
+        if len(optionlist) == 2:
+            if optionlist[1].startswith('/') & optionlist[1].endswith('/'):
+                option = optionlist[1]
+                pattern = re.compile(option[1:len(option)-1],re.S)
+                dict[optionlist[0]] = pattern
+            else:
+                dict[optionlist[0]] = optionlist[1]
+        else:
+            raise Exception(u'[%s]格式错误,请参照（属性=>属性值）' % locatorlist[i])
+    return dict
+
+def buildXpath(locator_dict):
+    """
+        将格式id=>123,name=>234字符串转为字典便于后续处理\n
+        :param locator: str 定位信息，格式参考：text=>123,class=>234 \n
+        """
+    selectors = locator_dict
+    # 如果有xpath，则默认只支持单定位信息，直接用xpath
+    if('xpath' in selectors):
+        return selectors['xpath']
+    xpath = ''
+    if('tagName' in selectors):
+        tagName = selectors['tagName']
+        del selectors['tagName']
+        tagNames = tagName.split('|')
+        for i in range(len(tagNames)):
+            if (len(xpath)>0):
+                xpath += '|'
+            xpath += './/' + tagNames[i]
+            if(len(selectors)>=1):
+                xpath += '['
+                for key in selectors:
+                    if not(xpath.endswith('[')):
+                        xpath += ' and '
+                    xpath += equalPair(key,selectors[key])
+                xpath  += ']'
+    else:
+        xpath = './/*'
+        if (len(selectors) >= 1):
+            xpath += '['
+            for key in selectors:
+                if not(xpath.endswith('[')):
+                    xpath += ' and '
+                xpath += equalPair(key,selectors[key])
+            xpath += ']'
+    return xpath
+
+
+def equalPair(key,value):
+    """
+    处理字典格式定位信息，用于拼接字符串\n
+    :param key: str 定位属性，格式参考：text
+    :param value: str 定位属性值，格式参考：123
+    """
+    pair = ''
+    if (key == 'className') | (key == 'class'):
+        pair = ' @class'+ '=\''+ value + '\''
+    elif key == 'text':
+        pair = 'normalize-space()=\'' + value + '\''
+    else:
+        pair =  '@'+ key + '=\''+ value + '\''
+    return pair
